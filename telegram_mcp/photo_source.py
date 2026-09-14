@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
+import os
 from dataclasses import dataclass
 from typing import Any, List, Optional
 
@@ -12,6 +14,29 @@ AVATAR_SOURCE = "avatars"
 MESSAGE_SOURCE = "messages"
 PHOTO_SOURCES = (AVATAR_SOURCE, MESSAGE_SOURCE)
 THUMBNAIL_TARGET_PIXELS = 320
+
+# On this account/network, a photo download can sit unanswered for minutes
+# at a time — not because Telethon or the network is broken (a fresh,
+# isolated connection downloads every size of the same photo in well under
+# a second), but because the single shared MTProto connection this server
+# keeps open all day is sometimes busy churning through a large backlog of
+# other updates first, and our GetFileRequest just waits in line behind it.
+# Bound every download attempt so callers get a real answer instead of
+# hanging forever. The first (full-resolution) attempt gets a generous
+# budget since it usually succeeds almost instantly and only occasionally
+# hits the slow path; the fallback attempt is capped much shorter so the
+# *total* worst case stays bounded instead of multiplying a long timeout
+# across every available size.
+PHOTO_DOWNLOAD_TIMEOUT_SECONDS = float(
+    os.getenv("TELEGRAM_PHOTO_DOWNLOAD_TIMEOUT_SECONDS", "30")
+)
+PHOTO_DOWNLOAD_FALLBACK_TIMEOUT_SECONDS = float(
+    os.getenv("TELEGRAM_PHOTO_DOWNLOAD_FALLBACK_TIMEOUT_SECONDS", "10")
+)
+
+
+class PhotoDownloadTimedOut(Exception):
+    """Raised when every size of a photo timed out while downloading."""
 
 
 class UnknownPhotoSource(ValueError):
@@ -164,17 +189,70 @@ def _thumbnail_size_index(photo: Any) -> Optional[int]:
     return None
 
 
+def _smallest_size_index(photo: Any) -> Optional[int]:
+    """The cheapest real size to fall back to — smallest width, excluding
+    zero-width/undeclared sizes (e.g. ``PhotoPathSize``) which are not a
+    plain downloadable image."""
+    available_sizes = getattr(photo, "sizes", None) or []
+    candidates = [
+        (index, getattr(size, "w", 0) or 0) for index, size in enumerate(available_sizes)
+    ]
+    candidates = [item for item in candidates if item[1] > 0]
+    if not candidates:
+        return None
+    return min(candidates, key=lambda item: item[1])[0]
+
+
+async def _download_one_size(
+    client, photo: Any, size_index: Optional[int], timeout: float
+) -> Optional[bytes]:
+    kwargs = {} if size_index is None else {"thumb": size_index}
+    try:
+        return await asyncio.wait_for(
+            client.download_media(photo, file=bytes, **kwargs),
+            timeout=timeout,
+        )
+    except asyncio.TimeoutError:
+        return None
+
+
 async def download_photo_bytes(
     client, reference: PhotoReference, thumbnail: bool = False
 ) -> bytes:
-    """Download one referenced photo straight to memory, never to disk."""
-    if thumbnail:
-        size_index = _thumbnail_size_index(reference.photo)
-        if size_index is not None:
-            downloaded = await client.download_media(reference.photo, file=bytes, thumb=size_index)
-            if downloaded:
-                return downloaded
-    return await client.download_media(reference.photo, file=bytes)
+    """Download one referenced photo straight to memory, never to disk.
+
+    On this account/network, a photo download can occasionally sit
+    unanswered for minutes — most likely the shared connection catching up
+    on a backlog of other updates first, not a broken download. Every
+    attempt here is time-boxed so callers always get either real bytes or a
+    prompt ``PhotoDownloadTimedOut`` — never an indefinite hang. The primary
+    attempt gets a generous budget (it usually finishes in well under a
+    second); if it times out, exactly one cheap fallback to the smallest
+    available size is tried with a short budget, keeping the total worst
+    case bounded instead of stacking a long timeout across every size.
+    """
+    primary_index = _thumbnail_size_index(reference.photo) if thumbnail else None
+    downloaded = await _download_one_size(
+        client, reference.photo, primary_index, PHOTO_DOWNLOAD_TIMEOUT_SECONDS
+    )
+    if downloaded:
+        return downloaded
+
+    fallback_index = _smallest_size_index(reference.photo)
+    if fallback_index is not None and fallback_index != primary_index:
+        downloaded = await _download_one_size(
+            client, reference.photo, fallback_index, PHOTO_DOWNLOAD_FALLBACK_TIMEOUT_SECONDS
+        )
+        if downloaded:
+            return downloaded
+
+    raise PhotoDownloadTimedOut(
+        f"Photo {reference.identifier} timed out after "
+        f"{PHOTO_DOWNLOAD_TIMEOUT_SECONDS:.0f}s (and a "
+        f"{PHOTO_DOWNLOAD_FALLBACK_TIMEOUT_SECONDS:.0f}s fallback attempt). "
+        "Telegram's response is likely just delayed behind other traffic on "
+        "the shared connection right now — retry in a bit."
+    )
 
 
 def peer_supports_source(entity: Any, source: str) -> bool:

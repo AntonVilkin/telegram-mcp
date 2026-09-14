@@ -21,6 +21,7 @@ from telegram_mcp.runtime import *
 from telegram_mcp.contact_sheet import ContactSheetUnavailable, build_contact_sheet
 from telegram_mcp.photo_source import (
     AVATAR_SOURCE,
+    PhotoDownloadTimedOut,
     UnknownPhotoSource,
     download_photo_bytes,
     find_photo_reference,
@@ -1149,7 +1150,10 @@ async def open_photo(
                 f" with id {wanted_identifier}." if wanted_identifier else "."
             )
 
-        photo_bytes = await download_photo_bytes(cl, reference)
+        try:
+            photo_bytes = await download_photo_bytes(cl, reference)
+        except PhotoDownloadTimedOut as timeout_error:
+            return str(timeout_error)
         if not photo_bytes:
             return f"Download failed for photo {reference.identifier}."
 
@@ -1215,7 +1219,10 @@ async def get_photo_sheet(
 
         tiles = []
         for reference in references:
-            thumbnail_bytes = await download_photo_bytes(cl, reference, thumbnail=True)
+            try:
+                thumbnail_bytes = await download_photo_bytes(cl, reference, thumbnail=True)
+            except PhotoDownloadTimedOut:
+                continue
             if thumbnail_bytes:
                 tiles.append((thumbnail_bytes, str(reference.identifier)))
         if not tiles:
