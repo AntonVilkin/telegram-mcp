@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import os
 from dataclasses import dataclass
-from typing import Any, List, Optional
+from typing import Any, Dict, List, Optional
 
 from telethon.tl import functions, types
 from telethon.tl.types import Channel, Chat, User
@@ -260,3 +260,27 @@ def peer_supports_source(entity: Any, source: str) -> bool:
     if validate_source(source) == MESSAGE_SOURCE:
         return isinstance(entity, (Chat, Channel, User))
     return True
+
+
+# --- shared-client download serialisation and reconnect (ported 15/11/2026) ---
+# Telethon #809: concurrent GetFile calls on one client race. Telethon #1536: a
+# half-alive MTProto sender hangs GetFile forever. Downloads are therefore
+# serialised per client and a hung attempt is followed by one forced reconnect.
+_download_locks: Dict[int, asyncio.Lock] = {}
+
+
+def download_lock_for(client) -> asyncio.Lock:
+    """The asyncio.Lock that serialises downloads on this client."""
+    key = id(client)
+    lock = _download_locks.get(key)
+    if lock is None:
+        lock = asyncio.Lock()
+        _download_locks[key] = lock
+    return lock
+
+
+async def force_reconnect_client(client) -> None:
+    """Reconnect the shared Telethon client after a hung GetFile."""
+    from telegram_mcp.runtime import _force_reconnect
+
+    await _force_reconnect(client)

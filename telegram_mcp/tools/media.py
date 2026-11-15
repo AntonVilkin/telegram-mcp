@@ -21,7 +21,10 @@ from telegram_mcp.runtime import *
 from telegram_mcp.contact_sheet import ContactSheetUnavailable, build_contact_sheet
 from telegram_mcp.photo_source import (
     AVATAR_SOURCE,
+    PHOTO_DOWNLOAD_TIMEOUT_SECONDS,
     PhotoDownloadTimedOut,
+    download_lock_for,
+    force_reconnect_client,
     UnknownPhotoSource,
     download_photo_bytes,
     find_photo_reference,
@@ -233,6 +236,11 @@ def _caption_format_kwargs(caption, parse_mode, custom_emojis):
     if parse_mode is None:
         return {}, None
     return {"parse_mode": None if parse_mode.lower() == "plain" else parse_mode}, None
+
+
+MEDIA_DOWNLOAD_TIMEOUT_SECONDS = float(
+    os.getenv("TELEGRAM_MEDIA_DOWNLOAD_TIMEOUT_SECONDS", str(PHOTO_DOWNLOAD_TIMEOUT_SECONDS))
+)
 
 
 class _DownloadLimitExceeded(Exception):
@@ -601,11 +609,51 @@ async def edit_message_media(
         )
 
 
+class _MediaDownloadTimedOut(Exception):
+    """Non-photo download timed out even after a reconnect retry."""
+
+
+async def _bounded_client_download_media(
+    client,
+    message,
+    *,
+    file: str,
+    progress_callback=None,
+) -> Optional[str]:
+    """``client.download_media`` with the same lock/timeout/reconnect as photos."""
+    lock = download_lock_for(client)
+    async with lock:
+        last_timeout = False
+        for attempt in range(2):
+            try:
+                downloaded = await asyncio.wait_for(
+                    client.download_media(
+                        message,
+                        file=file,
+                        progress_callback=progress_callback,
+                    ),
+                    timeout=MEDIA_DOWNLOAD_TIMEOUT_SECONDS,
+                )
+            except asyncio.TimeoutError:
+                last_timeout = True
+                if attempt == 0:
+                    await force_reconnect_client(client)
+                    continue
+                break
+            return downloaded
+        if last_timeout:
+            raise _MediaDownloadTimedOut(
+                f"Media download timed out after {MEDIA_DOWNLOAD_TIMEOUT_SECONDS:.0f}s "
+                "even after reconnecting."
+            )
+        return None
+
 @mcp.tool(
     annotations=ToolAnnotations(title="Download Media", openWorldHint=True, destructiveHint=True)
 )
 @with_account(readonly=False)
 @validate_id("chat_id")
+
 async def download_media(
     chat_id: Union[int, str],
     message_id: int,
@@ -686,13 +734,19 @@ async def download_media(
                     raise _DownloadLimitExceeded
 
             try:
-                downloaded = await cl.download_media(
+                downloaded = await _bounded_client_download_media(
+                    cl,
                     target,
                     file=str(temp_requested_path),
                     progress_callback=enforce_download_limit,
                 )
             except _DownloadLimitExceeded:
                 return f"Media is too large for download_media (limit: {limit} bytes)."
+            except _MediaDownloadTimedOut as timeout_error:
+                return (
+                    "Media download timed out: the media connection may be unreachable "
+                    "right now. Retry shortly."
+                )
 
             if not downloaded:
                 return f"Download failed for message {message_id}."
@@ -1153,7 +1207,10 @@ async def open_photo(
         try:
             photo_bytes = await download_photo_bytes(cl, reference)
         except PhotoDownloadTimedOut as timeout_error:
-            return str(timeout_error)
+            return (
+                "Photo download timed out: the media connection may be unreachable right now. "
+                "Retry shortly."
+            )
         if not photo_bytes:
             return f"Download failed for photo {reference.identifier}."
 
